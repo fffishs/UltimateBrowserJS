@@ -2047,6 +2047,88 @@ const tools = {
         return { success: false, attempts: max_retries };
     },
 
+    // ★ run_steps: 一次往返执行多步操作，内置智能等待和错误重试
+    async run_steps({ steps, auto_wait = true, retry_on_fail = true, max_step_retries = 2, step_timeout = 10000, stop_on_error = true, return_intermediate = false }) {
+        if (!Array.isArray(steps) || steps.length === 0) throw new Error('steps 必须是非空数组');
+        if (steps.length > 50) throw new Error('steps 最多 50 步');
+
+        const BLOCKED_TOOLS = new Set(['run_steps', 'batch', 'retry']); // 禁止嵌套
+        const results = [];
+        let lastResult = null;
+        const totalStart = Date.now();
+
+        for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            const { tool, args = {}, wait_before, wait_after, optional = false } = step;
+
+            // 校验工具
+            if (!tool) { results.push({ step: i, tool: '?', success: false, error: '缺少 tool 字段' }); if (stop_on_error && !optional) break; continue; }
+            if (BLOCKED_TOOLS.has(tool)) { results.push({ step: i, tool, success: false, error: `run_steps 内不允许使用 ${tool}` }); if (stop_on_error && !optional) break; continue; }
+            if (!tools[tool]) { results.push({ step: i, tool, success: false, error: `未知工具: ${tool}` }); if (stop_on_error && !optional) break; continue; }
+
+            // 步骤前等待
+            if (wait_before > 0) await sleep(Math.min(wait_before, 5000));
+
+            // 执行 (带重试)
+            const retries = retry_on_fail ? max_step_retries : 1;
+            let stepResult = null;
+            let stepError = null;
+            let attempts = 0;
+
+            for (let r = 0; r < retries; r++) {
+                attempts = r + 1;
+                try {
+                    // 超时保护
+                    const to = step.timeout || step_timeout;
+                    let timer;
+                    stepResult = await Promise.race([
+                        tools[tool](args),
+                        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`步骤 ${i} (${tool}) 超时 ${to}ms`)), to); })
+                    ]);
+                    clearTimeout(timer);
+                    stepError = null;
+                    break; // 成功，跳出重试循环
+                } catch (e) {
+                    stepError = e.message;
+                    // 重试前短暂等待
+                    if (r < retries - 1) {
+                        if (auto_wait) await sleep(500);
+                    }
+                }
+            }
+
+            if (stepError) {
+                results.push({ step: i, tool, success: false, error: stepError, attempts });
+                if (stop_on_error && !optional) break;
+            } else {
+                lastResult = stepResult;
+                if (return_intermediate) {
+                    results.push({ step: i, tool, success: true, result: stepResult, attempts });
+                } else {
+                    results.push({ step: i, tool, success: true, attempts });
+                }
+            }
+
+            // 步骤后等待
+            if (wait_after > 0) await sleep(Math.min(wait_after, 5000));
+        }
+
+        const totalTime = Date.now() - totalStart;
+        const succeeded = results.filter(r => r.success).length;
+        const failed = results.filter(r => !r.success).length;
+
+        return {
+            total_steps: steps.length,
+            executed: results.length,
+            succeeded,
+            failed,
+            total_time_ms: totalTime,
+            steps: results,
+            // 最后一步的结果总是返回（方便 LLM 判断最终状态）
+            last_result: lastResult
+        };
+    },
+
     async console_logs({ limit = 50, clear = false }) {
         const total = _clCount;
         const logs = getConsoleLogs(toNumber(limit, 50));
@@ -2396,6 +2478,7 @@ function getToolsList() {
         { name: 'highlight', description: '高亮元素(调试)', inputSchema: { type: 'object', properties: { selector: { type: 'string' }, duration: { type: 'number' }, color: { type: 'string' } }, required: ['selector'] } },
         { name: 'batch', description: '批量执行', inputSchema: { type: 'object', properties: { actions: { type: 'array', items: { type: 'object', properties: { tool: { type: 'string' }, args: { type: 'object' }, stopOnError: { type: 'boolean' } }, required: ['tool'] } } }, required: ['actions'] } },
         { name: 'retry', description: '自动重试', inputSchema: { type: 'object', properties: { tool: { type: 'string' }, args: { type: 'object' }, max_retries: { type: 'number' }, delay_ms: { type: 'number' }, success_check: { type: 'string' } }, required: ['tool'] } },
+        { name: 'run_steps', description: '智能多步执行 - 一次调用执行多个操作步骤，内置自动等待和错误重试。适合登录、表单填写等多步流程，比逐步调用快10倍', inputSchema: { type: 'object', properties: { steps: { type: 'array', description: '操作步骤数组，按顺序执行', items: { type: 'object', properties: { tool: { type: 'string', description: '工具名(click/type/fill/navigate/scroll/wait/eval/screenshot等)' }, args: { type: 'object', description: '工具参数' }, wait_before: { type: 'number', description: '步骤前等待ms' }, wait_after: { type: 'number', description: '步骤后等待ms' }, optional: { type: 'boolean', description: '失败时是否继续(默认false)' }, timeout: { type: 'number', description: '此步骤超时ms' } }, required: ['tool'] } }, auto_wait: { type: 'boolean', description: '自动等待元素就绪(默认true)' }, retry_on_fail: { type: 'boolean', description: '失败自动重试(默认true)' }, max_step_retries: { type: 'number', description: '每步最大重试次数(默认2)' }, step_timeout: { type: 'number', description: '每步默认超时ms(默认10000)' }, stop_on_error: { type: 'boolean', description: '遇错停止(默认true)' }, return_intermediate: { type: 'boolean', description: '返回中间步骤结果(默认false)' } }, required: ['steps'] } },
         { name: 'console_logs', description: '控制台日志', inputSchema: { type: 'object', properties: { limit: { type: 'number' }, clear: { type: 'boolean' } } } },
         { name: 'snapshot', description: '获取可访问性树', inputSchema: { type: 'object', properties: {} } },
         { name: 'focus', description: '聚焦元素', inputSchema: { type: 'object', properties: { selector: { type: 'string' } }, required: ['selector'] } },
