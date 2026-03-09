@@ -165,6 +165,33 @@ function getPageAndContext() {
     return { page: p, ctx };
 }
 
+// ★ 从工具结果中提取精简摘要，让 LLM 不用截图就能理解每步发生了什么
+function _extractBrief(tool, result) {
+    if (!result || typeof result !== 'object') return undefined;
+    switch (tool) {
+        case 'click':      return [result.elementText && `"${result.elementText}"`, result.url].filter(Boolean).join(' → ') || 'ok';
+        case 'type':        return result.currentValue !== undefined ? `value="${result.currentValue}"` : 'ok';
+        case 'fill':        return result.currentValue !== undefined ? `value="${result.currentValue}"` : 'ok';
+        case 'navigate':    return `${result.title || ''} (${result.finalUrl || result.navigated || ''})`.slice(0, 120);
+        case 'get_page':    return result.url || result.title || result.text?.slice(0, 100) || JSON.stringify(result).slice(0, 100);
+        case 'get':         return JSON.stringify(result).slice(0, 150);
+        case 'get_text':    return (result.text || '').slice(0, 100);
+        case 'eval':        return typeof result.result === 'string' ? result.result.slice(0, 150) : JSON.stringify(result.result).slice(0, 100);
+        case 'find':        return `found=${result.found}/${result.total}`;
+        case 'check':       return `${result.state}=${result.result}`;
+        case 'assert':      return result.passed ? 'passed' : `failed: ${result.message || ''}`.slice(0, 80);
+        case 'wait':        return `waited ${result.waited || ''}ms`;
+        case 'select':      return result.selected || 'ok';
+        case 'status':      return result.connected ? `connected, ${result.tabCount} tabs` : 'disconnected';
+        case 'list_tabs':   return `${result.count} tabs`;
+        case 'switch_tab':  return `tab ${result.switched}`;
+        case 'screenshot':  return 'captured';
+        case 'press_key':   return result.pressed || 'ok';
+        case 'hotkey':      return result.pressed || 'ok';
+        default:            return undefined; // 不认识的工具不附加 brief
+    }
+}
+
 function isInFrame() {
     return frameStack.length > 0;
 }
@@ -808,7 +835,12 @@ const tools = {
         const p = ensurePage();
         frameStack = [];
         await p.goto(url, { waitUntil: wait_until, timeout: toNumber(timeout, LONG_TIMEOUT) });
-        return { navigated: url, title: await safeGetTitle(p), inFrame: false };
+        const finalUrl = safeGetUrl(p);
+        const title = await safeGetTitle(p);
+        // ★ 检测是否有登录弹窗/对话框等常见元素
+        let hasDialog = false;
+        try { hasDialog = await p.locator('[role="dialog"], [class*="modal"], [class*="dialog"], [class*="popup"]').first().isVisible({ timeout: 300 }); } catch {}
+        return { navigated: url, finalUrl, title, redirected: finalUrl !== url, hasDialog, inFrame: false };
     },
 
     async reload({ timeout }) {
@@ -1012,7 +1044,18 @@ const tools = {
             await p.waitForLoadState(wait_after, { timeout: LONG_TIMEOUT });
         }
 
-        return { clicked: true, mode, type, inFrame: isInFrame() };
+        // ★ 返回丰富的状态信息，避免 LLM 需要截图判断结果
+        const result = { clicked: true, mode, type, inFrame: isInFrame() };
+        try {
+            const afterUrl = safeGetUrl(p);
+            result.url = afterUrl;
+            result.title = await safeGetTitle(p);
+            // 如果是 locator 点击，获取点击元素的文本
+            if (locator) {
+                try { result.elementText = (await locator.textContent({ timeout: 500 }))?.trim().slice(0, 100) || ''; } catch {}
+            }
+        } catch {}
+        return result;
     },
 
     // ==================== 统一输入工具 ====================
@@ -1122,7 +1165,15 @@ const tools = {
             await p.keyboard.press('Enter');
         }
 
-        return { typed: true, length: textStr.length, mode, inFrame: isInFrame() };
+        // ★ 返回输入框的实际值，避免 LLM 需要截图确认
+        const result = { typed: true, length: textStr.length, mode, inFrame: isInFrame() };
+        try { result.currentValue = await locator.inputValue({ timeout: 500 }); } catch {
+            try { result.currentValue = (await locator.textContent({ timeout: 500 }))?.trim().slice(0, 200) || ''; } catch {}
+        }
+        if (press_enter) {
+            try { result.url = safeGetUrl(p); result.title = await safeGetTitle(p); } catch {}
+        }
+        return result;
     },
 
     // 快速填充 (直接替换值)
@@ -1133,7 +1184,10 @@ const tools = {
         if (text === undefined || text === null) text = '';
         const locator = getFastLocator(ctx, selector);
         await locator.fill(String(text), { timeout: toNumber(timeout, FAST_TIMEOUT) });
-        return { filled: selector, text: String(text).slice(0, 50), inFrame: isInFrame() };
+        // ★ 返回实际值确认
+        let currentValue;
+        try { currentValue = await locator.inputValue({ timeout: 500 }); } catch {}
+        return { filled: selector, text: String(text).slice(0, 50), currentValue, inFrame: isInFrame() };
     },
 
     // 批量填表
@@ -2102,10 +2156,12 @@ const tools = {
                 if (stop_on_error && !optional) break;
             } else {
                 lastResult = stepResult;
+                // ★ 自动提取精简状态摘要 — 不需要截图就能知道每步发生了什么
+                const brief = _extractBrief(tool, stepResult);
                 if (return_intermediate) {
-                    results.push({ step: i, tool, success: true, result: stepResult, attempts });
+                    results.push({ step: i, tool, success: true, brief, result: stepResult, attempts });
                 } else {
-                    results.push({ step: i, tool, success: true, attempts });
+                    results.push({ step: i, tool, success: true, brief, attempts });
                 }
             }
 
@@ -2117,6 +2173,13 @@ const tools = {
         const succeeded = results.filter(r => r.success).length;
         const failed = results.filter(r => !r.success).length;
 
+        // ★ 附加最终页面状态（URL + title），省去一次额外的 status/screenshot 调用
+        let pageState;
+        try {
+            const p = ensurePage();
+            pageState = { url: safeGetUrl(p), title: await safeGetTitle(p) };
+        } catch {}
+
         return {
             total_steps: steps.length,
             executed: results.length,
@@ -2124,8 +2187,8 @@ const tools = {
             failed,
             total_time_ms: totalTime,
             steps: results,
-            // 最后一步的结果总是返回（方便 LLM 判断最终状态）
-            last_result: lastResult
+            last_result: lastResult,
+            page: pageState
         };
     },
 
