@@ -1,0 +1,16 @@
+{
+  "name": "ultimate-browser-mcp",
+  "version": "4.1.0",
+  "description": "Ultimate Chrome MCP - 极速反检测浏览器自动化",
+  "main": "server.js",
+  "bin": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
